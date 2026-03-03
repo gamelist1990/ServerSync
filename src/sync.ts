@@ -57,13 +57,24 @@ async function listDestinationFiles(rootDir: string, filters: string[]): Promise
 export async function startReceiver(port: number, targetDir: string, filters: string[] = []): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
 
+  const startupTable = new Table({ head: [chalk.cyan("Receiver"), chalk.cyan("Value")] });
+  startupTable.push(["Port", `${port}`]);
+  startupTable.push(["Target dir", targetDir]);
+  startupTable.push(["Host", os.hostname()]);
+  startupTable.push(["Filters", filters.length === 0 ? "(none)" : `${filters.length} item(s)`]);
+  console.log(startupTable.toString());
+
   const server = net.createServer((socket: any) => {
     const remote = `${socket.remoteAddress ?? "unknown"}:${socket.remotePort ?? "?"}`;
     let manifest: FileManifestItem[] = [];
     let expectedFileCount = 0;
     let needed = new Set<string>();
+    let expectedBytes = 0;
+    let receivedBytes = 0;
+    let startedAt = 0;
     let deletedCount = 0;
     let writtenCount = 0;
+    let receiveBar: any;
 
     console.log(chalk.cyan(`[receiver] connected: ${remote}`));
 
@@ -119,6 +130,33 @@ export async function startReceiver(port: number, targetDir: string, filters: st
 
           needed = new Set(needList);
           expectedFileCount = needList.length;
+          expectedBytes = filteredManifest
+            .filter((item) => needed.has(item.path))
+            .reduce((sum, item) => sum + item.size, 0);
+          receivedBytes = 0;
+          startedAt = Date.now();
+
+          receiveBar = new cliProgress.SingleBar(
+            {
+              format:
+                `${chalk.green("Receive")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} files | {speed} MB/s | {elapsed}`,
+              hideCursor: true,
+              clearOnComplete: false,
+              barCompleteChar: "#",
+              barIncompleteChar: "-"
+            },
+            cliProgress.Presets.shades_classic
+          );
+
+          receiveBar.start(Math.max(expectedBytes, 1), 0, {
+            pct: expectedBytes === 0 ? "100.00" : "0.00",
+            sent: formatBytes(0),
+            size: formatBytes(expectedBytes),
+            files: 0,
+            fileTotal: expectedFileCount,
+            speed: "0.00",
+            elapsed: "0:00"
+          });
 
           console.log(
             chalk.cyan(
@@ -157,7 +195,27 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           await fs.mkdir(path.dirname(absPath), { recursive: true });
           await fs.writeFile(absPath, data);
           writtenCount += 1;
+          const fileSize = manifest.find((item) => item.path === msg.path)?.size ?? data.length;
+          receivedBytes += fileSize;
           needed.delete(msg.path);
+
+          if (receiveBar) {
+            const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
+            const speedMbps = receivedBytes / (1024 * 1024) / elapsedSeconds;
+            const actualPct = expectedBytes === 0 ? 100 : (receivedBytes / expectedBytes) * 100;
+            const safePct = receivedBytes < expectedBytes ? Math.min(actualPct, 99.99) : 100;
+
+            receiveBar.update(Math.min(receivedBytes, Math.max(expectedBytes, 1)), {
+              pct: safePct.toFixed(2),
+              sent: formatBytes(receivedBytes),
+              size: formatBytes(expectedBytes),
+              files: writtenCount,
+              fileTotal: expectedFileCount,
+              speed: speedMbps.toFixed(2),
+              elapsed: formatElapsed(elapsedSeconds)
+            });
+          }
+
           if (writtenCount % 25 === 0 || needed.size === 0) {
             console.log(chalk.cyan(`[receiver] write progress: ${writtenCount}/${expectedFileCount} pending=${needed.size}`));
           }
@@ -169,7 +227,32 @@ export async function startReceiver(port: number, targetDir: string, filters: st
 
         if (msg.type === "done") {
           sendStatus("finalizing");
+          if (receiveBar) {
+            const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
+            const speedMbps = receivedBytes / (1024 * 1024) / elapsedSeconds;
+            receiveBar.update(Math.max(expectedBytes, 1), {
+              pct: "100.00",
+              sent: formatBytes(receivedBytes),
+              size: formatBytes(expectedBytes),
+              files: writtenCount,
+              fileTotal: expectedFileCount,
+              speed: speedMbps.toFixed(2),
+              elapsed: formatElapsed(elapsedSeconds)
+            });
+            receiveBar.stop();
+            receiveBar = undefined;
+          }
+
           console.log(chalk.green(`[receiver] finalizing: received=${writtenCount} deleted=${deletedCount} pending=${needed.size}`));
+
+          const resultTable = new Table({ head: [chalk.cyan("Receiver Result"), chalk.cyan("Value")] });
+          resultTable.push(["Remote", remote]);
+          resultTable.push(["Received files", `${writtenCount}/${expectedFileCount}`]);
+          resultTable.push(["Received bytes", `${formatBytes(receivedBytes)} / ${formatBytes(expectedBytes)}`]);
+          resultTable.push(["Deleted", `${deletedCount}`]);
+          resultTable.push(["Pending", `${needed.size}`]);
+          console.log(resultTable.toString());
+
           writeMessage(socket, {
             type: "result",
             received: writtenCount,
@@ -179,6 +262,10 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           socket.end();
         }
       } catch (error) {
+        if (receiveBar) {
+          receiveBar.stop();
+          receiveBar = undefined;
+        }
         console.log(
           chalk.red(`[receiver] processing error (${remote}): ${error instanceof Error ? error.message : "Unknown receiver error"}`)
         );
@@ -196,9 +283,7 @@ export async function startReceiver(port: number, targetDir: string, filters: st
     server.listen(port, () => resolve());
   });
 
-  console.log(chalk.green(`Receiver listening on port ${port}`));
-  console.log(chalk.green(`Target dir: ${targetDir}`));
-  console.log(chalk.green(`Host: ${os.hostname()}`));
+  console.log(chalk.green("Receiver listening..."));
 }
 
 export async function pushToReceiver(options: {
