@@ -1,6 +1,7 @@
 import path from "node:path";
-import readline from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
+import chalk from "chalk";
+import inquirer from "inquirer";
+import Table from "cli-table3";
 import { ensureSettings, loadSettings, saveSettings } from "./settings.js";
 import { startReceiver, pushToReceiver } from "./sync.js";
 
@@ -35,10 +36,38 @@ function parseHostPortInput(raw: string): { host: string; port: number } | undef
   return { host, port };
 }
 
+function printFilters(filters: string[]): void {
+  if (filters.length === 0) {
+    console.log(chalk.yellow("No filters configured"));
+    return;
+  }
+
+  const table = new Table({ head: [chalk.cyan("#"), chalk.cyan("Filter")], colWidths: [6, 90] });
+  filters.forEach((filter, i) => {
+    table.push([`${i + 1}`, filter]);
+  });
+  console.log(table.toString());
+}
+
+function printProfiles(profiles: Record<string, { host: string; port: number }>): void {
+  const names = Object.keys(profiles);
+  if (names.length === 0) {
+    console.log(chalk.yellow("No profiles saved"));
+    return;
+  }
+
+  const table = new Table({ head: [chalk.cyan("Name"), chalk.cyan("Target")] });
+  names.forEach((name) => {
+    const profile = profiles[name];
+    table.push([name, `${profile.host}:${profile.port}`]);
+  });
+  console.log(table.toString());
+}
+
 async function addFilter(rawPath: string): Promise<void> {
   const targetPath = normalizeFilterInput(rawPath);
   if (!targetPath) {
-    console.log("Path is empty");
+    console.log(chalk.red("Path is empty"));
     return;
   }
 
@@ -46,133 +75,130 @@ async function addFilter(rawPath: string): Promise<void> {
   if (!settings.filters.includes(targetPath)) {
     settings.filters.push(targetPath);
     await saveSettings(settings);
-    console.log(`Added filter: ${targetPath}`);
+    console.log(chalk.green(`Added filter: ${targetPath}`));
   } else {
-    console.log(`Already exists: ${targetPath}`);
+    console.log(chalk.yellow(`Already exists: ${targetPath}`));
   }
 }
 
 async function removeFilter(rawPath: string): Promise<void> {
   const targetPath = normalizeFilterInput(rawPath);
   if (!targetPath) {
-    console.log("Path is empty");
+    console.log(chalk.red("Path is empty"));
     return;
   }
 
   const settings = await loadSettings();
   const nextFilters = settings.filters.filter((x: string) => x !== targetPath);
   if (nextFilters.length === settings.filters.length) {
-    console.log(`Not found: ${targetPath}`);
+    console.log(chalk.yellow(`Not found: ${targetPath}`));
     return;
   }
 
   settings.filters = nextFilters;
   await saveSettings(settings);
-  console.log(`Removed filter: ${targetPath}`);
+  console.log(chalk.green(`Removed filter: ${targetPath}`));
 }
 
 async function promptMenu(): Promise<"listen" | "connect" | "settings"> {
-  const rl = readline.createInterface({ input, output });
-  try {
-    console.log("Select mode:");
-    console.log("1) listen  (open port and receive)");
-    console.log("2) connect (send diff to receiver)");
-    console.log("3) settings (edit filters/server)");
+  const answer = await inquirer.prompt<{ mode: "listen" | "connect" | "settings" }>([
+    {
+      type: "list",
+      name: "mode",
+      message: "Select mode",
+      choices: [
+        { name: "listen  (open port and receive)", value: "listen" },
+        { name: "connect (send diff to receiver)", value: "connect" },
+        { name: "settings (edit filters/server)", value: "settings" }
+      ]
+    }
+  ]);
 
-    const answer = (await rl.question("> ")).trim();
-    if (answer === "1") return "listen";
-    if (answer === "2") return "connect";
-    return "settings";
-  } finally {
-    rl.close();
-  }
+  return answer.mode;
 }
 
 async function runSettingsMenu(): Promise<void> {
-  const rl = readline.createInterface({ input, output });
-  try {
-    while (true) {
-      const settings = await loadSettings();
-      console.log("Settings Menu:");
-      console.log("1) filter list");
-      console.log("2) filter add");
-      console.log("3) filter remove");
-      console.log("4) server show");
-      console.log("5) server set");
-      console.log("6) server clear");
-      console.log("0) exit");
+  while (true) {
+    const settings = await loadSettings();
 
-      const line = (await rl.question("> ")).trim();
-      const firstSpace = line.indexOf(" ");
-      const choice = firstSpace >= 0 ? line.slice(0, firstSpace) : line;
-      const inlinePath = firstSpace >= 0 ? line.slice(firstSpace + 1).trim() : "";
-
-      if (choice === "0") {
-        return;
+    const answer = await inquirer.prompt<{ action: string }>([
+      {
+        type: "list",
+        name: "action",
+        message: "Settings Menu",
+        choices: [
+          { name: "filter list", value: "filter-list" },
+          { name: "filter add", value: "filter-add" },
+          { name: "filter remove", value: "filter-remove" },
+          { name: "server show", value: "server-show" },
+          { name: "server set", value: "server-set" },
+          { name: "server clear", value: "server-clear" },
+          { name: "exit", value: "exit" }
+        ]
       }
+    ]);
 
-      if (choice === "1") {
-        if (settings.filters.length === 0) {
-          console.log("No filters configured");
-        } else {
-          for (const filter of settings.filters) {
-            console.log(filter);
-          }
-        }
-        continue;
-      }
-
-      if (choice === "2") {
-        const rawPath = inlinePath || (await rl.question("Path to exclude: ")).trim();
-        await addFilter(rawPath);
-        continue;
-      }
-
-      if (choice === "3") {
-        const rawPath = inlinePath || (await rl.question("Path to include again: ")).trim();
-        await removeFilter(rawPath);
-        continue;
-      }
-
-      if (choice === "4") {
-        if (!settings.lastTarget) {
-          console.log("No default server configured");
-        } else {
-          console.log(`${settings.lastTarget.host}:${settings.lastTarget.port}`);
-        }
-        continue;
-      }
-
-      if (choice === "5") {
-        const rawServer = inlinePath || (await rl.question("Server (host:port): ")).trim();
-        const parsed = parseHostPortInput(rawServer);
-        if (!parsed) {
-          console.log("Invalid format. Use host:port (e.g. 100.94.26.8:47321)");
-          continue;
-        }
-
-        settings.lastTarget = parsed;
-        await saveSettings(settings);
-        console.log(`Default server set: ${parsed.host}:${parsed.port}`);
-        continue;
-      }
-
-      if (choice === "6") {
-        if (!settings.lastTarget) {
-          console.log("No default server configured");
-          continue;
-        }
-
-        delete settings.lastTarget;
-        await saveSettings(settings);
-        console.log("Default server cleared");
-        continue;
-      }
-
-      console.log("Invalid selection");
+    if (answer.action === "exit") {
+      return;
     }
-  } finally {
-    rl.close();
+
+    if (answer.action === "filter-list") {
+      printFilters(settings.filters);
+      continue;
+    }
+
+    if (answer.action === "filter-add") {
+      const inputAnswer = await inquirer.prompt<{ filterPath: string }>([
+        { type: "input", name: "filterPath", message: "Path to exclude:" }
+      ]);
+      await addFilter(inputAnswer.filterPath);
+      continue;
+    }
+
+    if (answer.action === "filter-remove") {
+      const inputAnswer = await inquirer.prompt<{ filterPath: string }>([
+        { type: "input", name: "filterPath", message: "Path to include again:" }
+      ]);
+      await removeFilter(inputAnswer.filterPath);
+      continue;
+    }
+
+    if (answer.action === "server-show") {
+      if (!settings.lastTarget) {
+        console.log(chalk.yellow("No default server configured"));
+      } else {
+        console.log(chalk.green(`${settings.lastTarget.host}:${settings.lastTarget.port}`));
+      }
+      continue;
+    }
+
+    if (answer.action === "server-set") {
+      const inputAnswer = await inquirer.prompt<{ server: string }>([
+        { type: "input", name: "server", message: "Server (host:port):" }
+      ]);
+      const parsed = parseHostPortInput(inputAnswer.server);
+      if (!parsed) {
+        console.log(chalk.red("Invalid format. Use host:port (e.g. 100.94.26.8:47321)"));
+        continue;
+      }
+
+      settings.lastTarget = parsed;
+      await saveSettings(settings);
+      console.log(chalk.green(`Default server set: ${parsed.host}:${parsed.port}`));
+      continue;
+    }
+
+    if (answer.action === "server-clear") {
+      if (!settings.lastTarget) {
+        console.log(chalk.yellow("No default server configured"));
+        continue;
+      }
+
+      delete settings.lastTarget;
+      await saveSettings(settings);
+      console.log(chalk.green("Default server cleared"));
+      continue;
+    }
   }
 }
 
@@ -231,7 +257,7 @@ export async function runCli(argv: string[]): Promise<void> {
 
     if (saveIndex >= 0 && args[saveIndex + 1]) {
       settings.profiles[args[saveIndex + 1]] = { host, port };
-      console.log(`Saved profile: ${args[saveIndex + 1]}`);
+      console.log(chalk.green(`Saved profile: ${args[saveIndex + 1]}`));
     }
 
     await saveSettings(settings);
@@ -248,25 +274,19 @@ export async function runCli(argv: string[]): Promise<void> {
         settings.filters.push(targetPath);
       }
       await saveSettings(settings);
-      console.log(`Added filter: ${targetPath}`);
+      console.log(chalk.green(`Added filter: ${targetPath}`));
       return;
     }
 
     if (action === "remove" && targetPath) {
       settings.filters = settings.filters.filter((x: string) => x !== targetPath);
       await saveSettings(settings);
-      console.log(`Removed filter: ${targetPath}`);
+      console.log(chalk.green(`Removed filter: ${targetPath}`));
       return;
     }
 
     if (action === "list") {
-      if (settings.filters.length === 0) {
-        console.log("No filters configured");
-      } else {
-        for (const filter of settings.filters) {
-          console.log(filter);
-        }
-      }
+      printFilters(settings.filters);
       return;
     }
 
@@ -275,16 +295,7 @@ export async function runCli(argv: string[]): Promise<void> {
 
   if (cmd === "profiles") {
     const settings = await loadSettings();
-    const names = Object.keys(settings.profiles);
-    if (names.length === 0) {
-      console.log("No profiles saved");
-      return;
-    }
-
-    for (const name of names) {
-      const profile = settings.profiles[name];
-      console.log(`${name}: ${profile.host}:${profile.port}`);
-    }
+    printProfiles(settings.profiles);
     return;
   }
 
@@ -293,7 +304,7 @@ export async function runCli(argv: string[]): Promise<void> {
     return;
   }
 
-  console.log("Commands:");
+  console.log(chalk.cyan("Commands:"));
   console.log("  listen [port] [targetDir]");
   console.log("  connect <host> <port> [--source <path>] [--save <profileName>]");
   console.log("  connect --profile <profileName> [--source <path>]");
