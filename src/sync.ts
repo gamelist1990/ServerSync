@@ -122,6 +122,12 @@ export async function startReceiver(port: number, targetDir: string, filters: st
               continue;
             }
 
+            const currentStat = await fs.stat(absPath);
+            if (currentStat.mtimeMs === file.mtimeMs && currentStat.size === file.size) {
+              // mtime と size が一致 → SHA1 計算不要
+              continue;
+            }
+
             const currentHash = await sha1File(absPath);
             if (currentHash !== file.sha1) {
               needList.push(file.path);
@@ -288,8 +294,9 @@ export async function pushToReceiver(options: {
   host: string;
   port: number;
   sourceDir: string;
+  filters?: string[];
 }): Promise<void> {
-  const manifest = await buildManifest(options.sourceDir, []);
+  const manifest = await buildManifest(options.sourceDir, options.filters ?? []);
   console.log(chalk.cyan(`Preparing sync: files=${manifest.length}`));
 
   await new Promise<void>((resolve, reject) => {

@@ -299,7 +299,8 @@ export async function runCli(argv: string[]): Promise<void> {
     await pushToReceiver({
       host,
       port,
-      sourceDir
+      sourceDir,
+      filters: settings.filters
     });
 
     settings.lastTarget = { host, port };

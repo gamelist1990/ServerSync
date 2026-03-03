@@ -8,6 +8,14 @@ type WalkResult = {
   files: string[];
 };
 
+type HashCacheEntry = {
+  mtimeMs: number;
+  size: number;
+  sha1: string;
+};
+
+type HashCache = Record<string, HashCacheEntry>;
+
 function normalizeFilterForRoot(rawFilter: string, rootDir: string): string {
   const cleaned = rawFilter.trim().replace(/^['\"]+|['\"]+$/g, "").replaceAll("\\", "/").replace(/^\.\//, "");
   if (!cleaned) return "";
@@ -75,18 +83,48 @@ export async function buildManifest(rootDir: string, filters: string[]): Promise
     throw new Error(`Source path does not exist: ${rootDir}`);
   }
 
+  // SHA1 キャッシュを読み込む
+  const cacheDir = path.join(rootDir, ".ServerSync");
+  const cachePath = path.join(cacheDir, "hash-cache.json");
+  let cache: HashCache = {};
+  try {
+    const raw = await fs.readFile(cachePath, "utf8");
+    cache = JSON.parse(raw) as HashCache;
+  } catch {
+    // キャッシュファイルがない / 読み込み失敗の場合は空のキャッシュから開始
+  }
+
   const walked = await collectFiles(rootDir, filters);
   const items: FileManifestItem[] = [];
+  let cacheUpdated = false;
 
   for (const absPath of walked.files) {
     const stat = await fs.stat(absPath);
     const rel = path.relative(rootDir, absPath).replaceAll("\\", "/");
+
+    let sha1: string;
+    const cached = cache[rel];
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      // キャッシュヒット: SHA1 再計算不要
+      sha1 = cached.sha1;
+    } else {
+      sha1 = await sha1File(absPath);
+      cache[rel] = { mtimeMs: stat.mtimeMs, size: stat.size, sha1 };
+      cacheUpdated = true;
+    }
+
     items.push({
       path: rel,
       size: stat.size,
       mtimeMs: stat.mtimeMs,
-      sha1: await sha1File(absPath)
+      sha1
     });
+  }
+
+  // 変更があった場合のみキャッシュを保存
+  if (cacheUpdated) {
+    await fs.mkdir(cacheDir, { recursive: true });
+    await fs.writeFile(cachePath, JSON.stringify(cache), "utf8");
   }
 
   items.sort((a, b) => a.path.localeCompare(b.path));
