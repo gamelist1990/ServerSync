@@ -5,8 +5,28 @@ export function writeMessage(socket: net.Socket, msg: WireMessage): void {
   socket.write(`${JSON.stringify(msg)}\n`);
 }
 
-export function bindMessageReader(socket: net.Socket, onMessage: (msg: WireMessage) => void): void {
+export function bindMessageReader(socket: net.Socket, onMessage: (msg: WireMessage) => void | Promise<void>): void {
   let buffer = "";
+  const queue: WireMessage[] = [];
+  let processing = false;
+
+  const processQueue = async (): Promise<void> => {
+    if (processing) return;
+    processing = true;
+
+    while (queue.length > 0) {
+      const msg = queue.shift();
+      if (!msg) continue;
+      await onMessage(msg);
+    }
+
+    processing = false;
+  };
+
+  const pushMessage = (msg: WireMessage): void => {
+    queue.push(msg);
+    void processQueue();
+  };
 
   socket.on("data", (chunk) => {
     buffer += chunk.toString("utf8");
@@ -20,9 +40,9 @@ export function bindMessageReader(socket: net.Socket, onMessage: (msg: WireMessa
       if (!raw) continue;
 
       try {
-        onMessage(JSON.parse(raw) as WireMessage);
+        pushMessage(JSON.parse(raw) as WireMessage);
       } catch {
-        onMessage({ type: "error", message: "Invalid JSON frame" });
+        pushMessage({ type: "error", message: "Invalid JSON frame" });
       }
     }
   });

@@ -17,19 +17,45 @@ async function listDestinationFiles(rootDir: string, filters: string[]): Promise
 export async function startReceiver(port: number, targetDir: string, filters: string[] = []): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
 
-  const server = net.createServer((socket) => {
+  const server = net.createServer((socket: any) => {
+    const remote = `${socket.remoteAddress ?? "unknown"}:${socket.remotePort ?? "?"}`;
     let manifest: FileManifestItem[] = [];
+    let expectedFileCount = 0;
     let needed = new Set<string>();
     let deletedCount = 0;
     let writtenCount = 0;
 
+    console.log(`[receiver] connected: ${remote}`);
+
+    socket.on("close", () => {
+      console.log(`[receiver] closed: ${remote}`);
+    });
+
+    socket.on("error", (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`[receiver] socket error (${remote}): ${message}`);
+    });
+
+    const sendStatus = (phase: "scanning" | "receiving" | "finalizing"): void => {
+      writeMessage(socket, {
+        type: "status",
+        phase,
+        received: writtenCount,
+        expected: expectedFileCount,
+        deleted: deletedCount,
+        pending: needed.size
+      });
+    };
+
     bindMessageReader(socket, async (msg: WireMessage) => {
       try {
         if (msg.type === "hello") {
+          console.log(`[receiver] hello from ${remote}, project=${msg.project}`);
           return;
         }
 
         if (msg.type === "manifest") {
+          sendStatus("scanning");
           manifest = msg.files;
           const filteredManifest = manifest.filter((f) => !shouldSkip(f.path, filters, targetDir));
           const expected = new Set(filteredManifest.map((f) => f.path));
@@ -52,6 +78,11 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           }
 
           needed = new Set(needList);
+          expectedFileCount = needList.length;
+
+          console.log(
+            `[receiver] scan: manifest=${manifest.length} eligible=${filteredManifest.length} need=${needList.length} delete=${deleteList.length}`
+          );
 
           for (const rel of deleteList) {
             await fs.rm(path.join(targetDir, rel), { force: true });
@@ -59,6 +90,11 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           }
 
           writeMessage(socket, { type: "need", files: needList, delete: deleteList });
+          sendStatus("receiving");
+          return;
+        }
+
+        if (msg.type === "status") {
           return;
         }
 
@@ -80,10 +116,18 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           await fs.writeFile(absPath, data);
           writtenCount += 1;
           needed.delete(msg.path);
+          if (writtenCount % 25 === 0 || needed.size === 0) {
+            console.log(`[receiver] write progress: ${writtenCount}/${expectedFileCount} pending=${needed.size}`);
+          }
+          if (writtenCount % 50 === 0 || needed.size === 0) {
+            sendStatus("receiving");
+          }
           return;
         }
 
         if (msg.type === "done") {
+          sendStatus("finalizing");
+          console.log(`[receiver] finalizing: received=${writtenCount} deleted=${deletedCount} pending=${needed.size}`);
           writeMessage(socket, {
             type: "result",
             received: writtenCount,
@@ -93,6 +137,7 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           socket.end();
         }
       } catch (error) {
+        console.log(`[receiver] processing error (${remote}): ${error instanceof Error ? error.message : "Unknown receiver error"}`);
         writeMessage(socket, {
           type: "error",
           message: error instanceof Error ? error.message : "Unknown receiver error"
@@ -118,19 +163,28 @@ export async function pushToReceiver(options: {
   sourceDir: string;
 }): Promise<void> {
   const manifest = await buildManifest(options.sourceDir, []);
+  console.log(`Preparing sync: files=${manifest.length}`);
 
   await new Promise<void>((resolve, reject) => {
     const socket = net.createConnection({ host: options.host, port: options.port });
     const byPath = new Map(manifest.map((f) => [f.path, f]));
+    let uploadTotal = 0;
+    let uploaded = 0;
+    let finished = false;
 
     socket.once("connect", () => {
       writeMessage(socket, { type: "hello", project: path.basename(options.sourceDir) });
       writeMessage(socket, { type: "manifest", files: manifest });
+      console.log(`Connected to ${options.host}:${options.port}`);
     });
 
     bindMessageReader(socket, async (msg: WireMessage) => {
       try {
         if (msg.type === "need") {
+          uploadTotal = msg.files.length;
+          uploaded = 0;
+          console.log(`Receiver requested ${uploadTotal} file(s), sending...`);
+
           for (const relPath of msg.files) {
             const info = byPath.get(relPath);
             if (!info) continue;
@@ -143,9 +197,18 @@ export async function pushToReceiver(options: {
               dataBase64: data.toString("base64"),
               sha1: info.sha1
             });
+
+            uploaded += 1;
+            const percent = uploadTotal === 0 ? 100 : Math.round((uploaded / uploadTotal) * 100);
+            console.log(`Upload progress: ${uploaded}/${uploadTotal} (${percent}%)`);
           }
 
           writeMessage(socket, { type: "done" });
+          return;
+        }
+
+        if (msg.type === "status") {
+          console.log(`Server status: phase=${msg.phase} received=${msg.received}/${msg.expected} pending=${msg.pending} deleted=${msg.deleted}`);
           return;
         }
 
@@ -154,6 +217,7 @@ export async function pushToReceiver(options: {
           if (msg.message) {
             console.log(msg.message);
           }
+          finished = true;
           socket.end();
           resolve();
           return;
@@ -170,5 +234,10 @@ export async function pushToReceiver(options: {
     });
 
     socket.once("error", reject);
+    socket.once("close", () => {
+      if (!finished) {
+        reject(new Error("Connection closed before sync result was received"));
+      }
+    });
   });
 }
