@@ -4,6 +4,7 @@ Diff-optimized server sync CLI built with Bun + TypeScript.
 
 ## What It Does
 
+
 - `listen`: opens a TCP port and receives updates into a target directory.
 - `connect`: sends only changed files to the receiver (hash-based diff).
 - `settings`: interactive menu to edit filter entries.
