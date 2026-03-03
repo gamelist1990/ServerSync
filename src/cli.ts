@@ -5,6 +5,16 @@ import Table from "cli-table3";
 import { ensureSettings, loadSettings, saveSettings } from "./settings.js";
 import { startReceiver, pushToReceiver } from "./sync.js";
 
+type ModeChoice = "listen" | "connect" | "settings";
+type SettingsAction =
+  | "filter-list"
+  | "filter-add"
+  | "filter-remove"
+  | "server-show"
+  | "server-set"
+  | "server-clear"
+  | "exit";
+
 function parseNumber(value: string, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -101,9 +111,9 @@ async function removeFilter(rawPath: string): Promise<void> {
 }
 
 async function promptMenu(): Promise<"listen" | "connect" | "settings"> {
-  const answer = await inquirer.prompt<{ mode: "listen" | "connect" | "settings" }>([
+  const answer = await inquirer.prompt<{ mode: ModeChoice | string }>([
     {
-      type: "list",
+      type: "rawlist",
       name: "mode",
       message: "Select mode",
       choices: [
@@ -114,16 +124,22 @@ async function promptMenu(): Promise<"listen" | "connect" | "settings"> {
     }
   ]);
 
-  return answer.mode;
+  const normalized = String(answer.mode ?? "").trim().toLowerCase();
+  if (normalized === "1" || normalized === "listen") return "listen";
+  if (normalized === "2" || normalized === "connect") return "connect";
+  if (normalized === "3" || normalized === "settings") return "settings";
+  return "settings";
 }
 
 async function runSettingsMenu(): Promise<void> {
+  let invalidCount = 0;
+
   while (true) {
     const settings = await loadSettings();
 
-    const answer = await inquirer.prompt<{ action: string }>([
+    const answer = await inquirer.prompt<{ action: SettingsAction | string }>([
       {
-        type: "list",
+        type: "rawlist",
         name: "action",
         message: "Settings Menu",
         choices: [
@@ -138,16 +154,46 @@ async function runSettingsMenu(): Promise<void> {
       }
     ]);
 
-    if (answer.action === "exit") {
+    const actionRaw = String(answer.action ?? "").trim().toLowerCase();
+    const action: SettingsAction | undefined =
+      actionRaw === "1" || actionRaw === "filter-list"
+        ? "filter-list"
+        : actionRaw === "2" || actionRaw === "filter-add"
+          ? "filter-add"
+          : actionRaw === "3" || actionRaw === "filter-remove"
+            ? "filter-remove"
+            : actionRaw === "4" || actionRaw === "server-show"
+              ? "server-show"
+              : actionRaw === "5" || actionRaw === "server-set"
+                ? "server-set"
+                : actionRaw === "6" || actionRaw === "server-clear"
+                  ? "server-clear"
+                  : actionRaw === "7" || actionRaw === "exit"
+                    ? "exit"
+                    : undefined;
+
+    if (!action) {
+      invalidCount += 1;
+      console.log(chalk.yellow("Invalid selection"));
+      if (invalidCount >= 3) {
+        console.log(chalk.red("Too many invalid selections. Exiting settings menu."));
+        return;
+      }
+      continue;
+    }
+
+    invalidCount = 0;
+
+    if (action === "exit") {
       return;
     }
 
-    if (answer.action === "filter-list") {
+    if (action === "filter-list") {
       printFilters(settings.filters);
       continue;
     }
 
-    if (answer.action === "filter-add") {
+    if (action === "filter-add") {
       const inputAnswer = await inquirer.prompt<{ filterPath: string }>([
         { type: "input", name: "filterPath", message: "Path to exclude:" }
       ]);
@@ -155,7 +201,7 @@ async function runSettingsMenu(): Promise<void> {
       continue;
     }
 
-    if (answer.action === "filter-remove") {
+    if (action === "filter-remove") {
       const inputAnswer = await inquirer.prompt<{ filterPath: string }>([
         { type: "input", name: "filterPath", message: "Path to include again:" }
       ]);
@@ -163,7 +209,7 @@ async function runSettingsMenu(): Promise<void> {
       continue;
     }
 
-    if (answer.action === "server-show") {
+    if (action === "server-show") {
       if (!settings.lastTarget) {
         console.log(chalk.yellow("No default server configured"));
       } else {
@@ -172,7 +218,7 @@ async function runSettingsMenu(): Promise<void> {
       continue;
     }
 
-    if (answer.action === "server-set") {
+    if (action === "server-set") {
       const inputAnswer = await inquirer.prompt<{ server: string }>([
         { type: "input", name: "server", message: "Server (host:port):" }
       ]);
@@ -188,7 +234,7 @@ async function runSettingsMenu(): Promise<void> {
       continue;
     }
 
-    if (answer.action === "server-clear") {
+    if (action === "server-clear") {
       if (!settings.lastTarget) {
         console.log(chalk.yellow("No default server configured"));
         continue;
@@ -207,7 +253,10 @@ export async function runCli(argv: string[]): Promise<void> {
   await loadSettings();
 
   const [command, ...args] = argv;
-  const cmd = command ?? (await promptMenu());
+  const selected = command ?? (await promptMenu());
+  const cmdRaw = String(selected).trim().toLowerCase();
+  const cmd: ModeChoice | string =
+    cmdRaw === "1" ? "listen" : cmdRaw === "2" ? "connect" : cmdRaw === "3" ? "settings" : selected;
 
   if (cmd === "listen") {
     const settings = await loadSettings();
