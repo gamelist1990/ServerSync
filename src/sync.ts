@@ -136,10 +136,22 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           receivedBytes = 0;
           startedAt = Date.now();
 
+          // ── ログはバー開始前にまとめて出す ──
+          console.log(
+            chalk.cyan(
+              `[receiver] scan  manifest=${manifest.length}  eligible=${filteredManifest.length}  need=${needList.length}  delete=${deleteList.length}`
+            )
+          );
+
+          for (const rel of deleteList) {
+            await fs.rm(path.join(targetDir, rel), { force: true });
+            deletedCount += 1;
+          }
+
           receiveBar = new cliProgress.SingleBar(
             {
-              format:
-                `${chalk.green("Receive")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} files | {speed} MB/s | {elapsed}`,
+              format: `${chalk.green("Receive")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} | {speed} MB/s | {elapsed}`,
+              barsize: 28,
               hideCursor: true,
               clearOnComplete: false,
               barCompleteChar: "#",
@@ -157,17 +169,6 @@ export async function startReceiver(port: number, targetDir: string, filters: st
             speed: "0.00",
             elapsed: "0:00"
           });
-
-          console.log(
-            chalk.cyan(
-              `[receiver] scan: manifest=${manifest.length} eligible=${filteredManifest.length} need=${needList.length} delete=${deleteList.length}`
-            )
-          );
-
-          for (const rel of deleteList) {
-            await fs.rm(path.join(targetDir, rel), { force: true });
-            deletedCount += 1;
-          }
 
           writeMessage(socket, { type: "need", files: needList, delete: deleteList });
           sendStatus("receiving");
@@ -216,9 +217,6 @@ export async function startReceiver(port: number, targetDir: string, filters: st
             });
           }
 
-          if (writtenCount % 25 === 0 || needed.size === 0) {
-            console.log(chalk.cyan(`[receiver] write progress: ${writtenCount}/${expectedFileCount} pending=${needed.size}`));
-          }
           if (writtenCount % 50 === 0 || needed.size === 0) {
             sendStatus("receiving");
           }
@@ -338,10 +336,13 @@ export async function pushToReceiver(options: {
           uploadStartedAt = Date.now();
           lastSpeedMbps = 0;
 
+          // ── ログはバー開始前にまとめて出す ──
+          console.log(chalk.cyan(`Uploading  ${uploadFiles} file(s)  ${formatBytes(uploadBytes)}`));
+
           progressBar = new cliProgress.SingleBar(
             {
-              format:
-                `${chalk.cyan("Upload")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} files | {speed} MB/s | {elapsed}`,
+              format: `${chalk.cyan("Upload")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} | {speed} MB/s | {elapsed}`,
+              barsize: 28,
               hideCursor: true,
               clearOnComplete: false,
               barCompleteChar: "#",
@@ -351,7 +352,7 @@ export async function pushToReceiver(options: {
           );
 
           const initialPct = uploadBytes === 0 ? "100.00" : "0.00";
-          progressBar.start(Math.max(uploadBytes, 1), Math.min(uploadedBytes, Math.max(uploadBytes, 1)), {
+          progressBar.start(Math.max(uploadBytes, 1), 0, {
             pct: initialPct,
             sent: formatBytes(0),
             size: formatBytes(uploadBytes),
@@ -360,8 +361,6 @@ export async function pushToReceiver(options: {
             speed: "0.00",
             elapsed: "0:00"
           });
-
-          console.log(chalk.cyan(`Receiver requested ${uploadFiles} file(s), ${formatBytes(uploadBytes)} total`));
 
           for (const relPath of msg.files) {
             const info = byPath.get(relPath);
@@ -414,11 +413,12 @@ export async function pushToReceiver(options: {
 
         if (msg.type === "status") {
           serverStatus = msg;
-          console.log(
-            chalk.gray(
-              `Server status: phase=${msg.phase} received=${msg.received}/${msg.expected} pending=${msg.pending} deleted=${msg.deleted}`
-            )
-          );
+          // バー動作中は bar.log() で安全に出力、停止中なら抑制（サマリーで確認できる）
+          if (progressBar) {
+            progressBar.log(
+              chalk.gray(`Server: phase=${msg.phase}  recv=${msg.received}/${msg.expected}  pending=${msg.pending}\n`)
+            );
+          }
           return;
         }
 
