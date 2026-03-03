@@ -1,0 +1,18 @@
+{
+  "name": "serversync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts",
+    "build:linux:x64": "bun build ./src/index.ts --compile --target=bun-linux-x64 --outfile ./dist/serversync-linux-x64",
+    "build:linux:arm64": "bun build ./src/index.ts --compile --target=bun-linux-arm64 --outfile ./dist/serversync-linux-arm64",
+    "build:windows:x64": "bun build ./src/index.ts --compile --target=bun-windows-x64 --outfile ./dist/serversync-windows-x64.exe",
+    "build:all": "bun run build:linux:x64 && bun run build:linux:arm64 && bun run build:windows:x64"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
