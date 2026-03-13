@@ -12,6 +12,11 @@ import { sha1Buffer, sha1File } from "./hash.js";
 import { bindMessageReader, writeMessage } from "./wire.js";
 import type { FileManifestItem, WireMessage } from "./types.js";
 
+const HASH_COMPARE_CONCURRENCY = 4;
+const DELETE_CONCURRENCY = 8;
+const RECEIVE_WRITE_CONCURRENCY = 4;
+const SEND_PRELOAD_CONCURRENCY = 4;
+
 function formatBytes(bytes: number): string {
   const units = ["B", "KB", "MB", "GB", "TB"];
   let size = bytes;
@@ -34,6 +39,67 @@ function formatElapsed(seconds: number): string {
   }
 
   return `${minutes}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatPathForDisplay(relativePath: string, maxLength = 56): string {
+  const normalized = relativePath.replaceAll("\\", "/");
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  const keep = Math.max(8, Math.floor((maxLength - 3) / 2));
+  return `${normalized.slice(0, keep)}...${normalized.slice(-(maxLength - keep - 3))}`;
+}
+
+async function removeEmptyParentDirs(rootDir: string, filePath: string): Promise<void> {
+  const resolvedRoot = path.resolve(rootDir);
+  let currentDir = path.dirname(path.resolve(filePath));
+
+  while (currentDir.startsWith(resolvedRoot) && currentDir !== resolvedRoot) {
+    const entries = await fs.readdir(currentDir);
+    if (entries.length > 0) {
+      return;
+    }
+
+    await fs.rmdir(currentDir);
+    currentDir = path.dirname(currentDir);
+  }
+}
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const runWorker = async (): Promise<void> => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  };
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+async function forEachConcurrent<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  await mapConcurrent(items, concurrency, async (item, index) => {
+    await worker(item, index);
+    return undefined;
+  });
 }
 
 async function writeMessageAsync(socket: net.Socket, msg: WireMessage): Promise<void> {
@@ -65,8 +131,10 @@ export async function startReceiver(port: number, targetDir: string, filters: st
   console.log(startupTable.toString());
 
   const server = net.createServer((socket: any) => {
+    socket.setNoDelay(true);
     const remote = `${socket.remoteAddress ?? "unknown"}:${socket.remotePort ?? "?"}`;
     let manifest: FileManifestItem[] = [];
+    let manifestByPath = new Map<string, FileManifestItem>();
     let expectedFileCount = 0;
     let needed = new Set<string>();
     let expectedBytes = 0;
@@ -75,6 +143,7 @@ export async function startReceiver(port: number, targetDir: string, filters: st
     let deletedCount = 0;
     let writtenCount = 0;
     let receiveBar: any;
+    const pendingReceiveWrites = new Set<Promise<void>>();
 
     console.log(chalk.cyan(`[receiver] connected: ${remote}`));
 
@@ -108,31 +177,29 @@ export async function startReceiver(port: number, targetDir: string, filters: st
         if (msg.type === "manifest") {
           sendStatus("scanning");
           manifest = msg.files;
+          manifestByPath = new Map(manifest.map((item) => [item.path, item]));
           const filteredManifest = manifest.filter((f) => !shouldSkip(f.path, filters, targetDir));
           const expected = new Set(filteredManifest.map((f) => f.path));
           const destinationFiles = existsSync(targetDir) ? await listDestinationFiles(targetDir, filters) : [];
 
           const deleteList = destinationFiles.filter((p) => !expected.has(p));
 
-          const needList: string[] = [];
-          for (const file of filteredManifest) {
+          const needFlags = await mapConcurrent(filteredManifest, HASH_COMPARE_CONCURRENCY, async (file) => {
             const absPath = path.join(targetDir, file.path);
             if (!existsSync(absPath)) {
-              needList.push(file.path);
-              continue;
+              return true;
             }
 
             const currentStat = await fs.stat(absPath);
             if (currentStat.mtimeMs === file.mtimeMs && currentStat.size === file.size) {
-              // mtime と size が一致 → SHA1 計算不要
-              continue;
+              return false;
             }
 
             const currentHash = await sha1File(absPath);
-            if (currentHash !== file.sha1) {
-              needList.push(file.path);
-            }
-          }
+            return currentHash !== file.sha1;
+          });
+
+          const needList = filteredManifest.filter((_, index) => needFlags[index]).map((file) => file.path);
 
           needed = new Set(needList);
           expectedFileCount = needList.length;
@@ -149,14 +216,18 @@ export async function startReceiver(port: number, targetDir: string, filters: st
             )
           );
 
-          for (const rel of deleteList) {
-            await fs.rm(path.join(targetDir, rel), { force: true });
+          await forEachConcurrent(deleteList, DELETE_CONCURRENCY, async (rel) => {
+            const absToDelete = path.join(targetDir, rel);
+            await fs.rm(absToDelete, { force: true });
+            await removeEmptyParentDirs(targetDir, absToDelete);
             deletedCount += 1;
-          }
+            console.log(chalk.yellow(`[receiver] deleted ${rel}`));
+          });
 
           receiveBar = new cliProgress.SingleBar(
             {
-              format: `${chalk.green("Receive")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} | {speed} MB/s | {elapsed}`,
+              format:
+                `${chalk.green("Receive")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} | {speed} MB/s | {elapsed} | {file}`,
               barsize: 28,
               hideCursor: true,
               clearOnComplete: false,
@@ -173,7 +244,8 @@ export async function startReceiver(port: number, targetDir: string, filters: st
             files: 0,
             fileTotal: expectedFileCount,
             speed: "0.00",
-            elapsed: "0:00"
+            elapsed: "0:00",
+            file: "-"
           });
 
           writeMessage(socket, { type: "need", files: needList, delete: deleteList });
@@ -190,46 +262,79 @@ export async function startReceiver(port: number, targetDir: string, filters: st
             return;
           }
 
-          const absPath = path.join(targetDir, msg.path);
-          const data = Buffer.from(msg.dataBase64, "base64");
-          const actualHash = sha1Buffer(data);
-          if (actualHash !== msg.sha1) {
-            writeMessage(socket, { type: "error", message: `Hash mismatch: ${msg.path}` });
-            socket.end();
-            return;
-          }
-
-          await fs.mkdir(path.dirname(absPath), { recursive: true });
-          await fs.writeFile(absPath, data);
-          writtenCount += 1;
-          const fileSize = manifest.find((item) => item.path === msg.path)?.size ?? data.length;
-          receivedBytes += fileSize;
-          needed.delete(msg.path);
-
           if (receiveBar) {
-            const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
-            const speedMbps = receivedBytes / (1024 * 1024) / elapsedSeconds;
-            const actualPct = expectedBytes === 0 ? 100 : (receivedBytes / expectedBytes) * 100;
-            const safePct = receivedBytes < expectedBytes ? Math.min(actualPct, 99.99) : 100;
-
             receiveBar.update(Math.min(receivedBytes, Math.max(expectedBytes, 1)), {
-              pct: safePct.toFixed(2),
+              pct: expectedBytes === 0 ? "100.00" : ((receivedBytes / expectedBytes) * 100).toFixed(2),
               sent: formatBytes(receivedBytes),
               size: formatBytes(expectedBytes),
               files: writtenCount,
               fileTotal: expectedFileCount,
-              speed: speedMbps.toFixed(2),
-              elapsed: formatElapsed(elapsedSeconds)
+              speed: "0.00",
+              elapsed: formatElapsed(Math.max((Date.now() - startedAt) / 1000, 0)),
+              file: formatPathForDisplay(msg.path)
             });
           }
+          const receiveTask = (async () => {
+            const absPath = path.join(targetDir, msg.path);
+            const data = Buffer.from(msg.dataBase64, "base64");
+            const actualHash = sha1Buffer(data);
+            if (actualHash !== msg.sha1) {
+              throw new Error(`Hash mismatch: ${msg.path}`);
+            }
 
-          if (writtenCount % 50 === 0 || needed.size === 0) {
-            sendStatus("receiving");
+            await fs.mkdir(path.dirname(absPath), { recursive: true });
+            await fs.writeFile(absPath, data);
+            writtenCount += 1;
+            const fileSize = manifestByPath.get(msg.path)?.size ?? data.length;
+            receivedBytes += fileSize;
+            needed.delete(msg.path);
+
+            if (receiveBar) {
+              const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
+              const speedMbps = receivedBytes / (1024 * 1024) / elapsedSeconds;
+              const actualPct = expectedBytes === 0 ? 100 : (receivedBytes / expectedBytes) * 100;
+              const safePct = receivedBytes < expectedBytes ? Math.min(actualPct, 99.99) : 100;
+
+              receiveBar.update(Math.min(receivedBytes, Math.max(expectedBytes, 1)), {
+                pct: safePct.toFixed(2),
+                sent: formatBytes(receivedBytes),
+                size: formatBytes(expectedBytes),
+                files: writtenCount,
+                fileTotal: expectedFileCount,
+                speed: speedMbps.toFixed(2),
+                elapsed: formatElapsed(elapsedSeconds),
+                file: formatPathForDisplay(msg.path)
+              });
+              receiveBar.log(chalk.gray(`received ${msg.path}\n`));
+            }
+
+            if (writtenCount % 50 === 0 || needed.size === 0) {
+              sendStatus("receiving");
+            }
+          })().catch((error) => {
+            writeMessage(socket, {
+              type: "error",
+              message: error instanceof Error ? error.message : `Receive failed: ${msg.path}`
+            });
+            socket.end();
+            throw error;
+          });
+
+          pendingReceiveWrites.add(receiveTask);
+          receiveTask.finally(() => {
+            pendingReceiveWrites.delete(receiveTask);
+          });
+
+          if (pendingReceiveWrites.size >= RECEIVE_WRITE_CONCURRENCY) {
+            await Promise.race(pendingReceiveWrites);
           }
           return;
         }
 
         if (msg.type === "done") {
+          if (pendingReceiveWrites.size > 0) {
+            await Promise.all(Array.from(pendingReceiveWrites));
+          }
           sendStatus("finalizing");
           if (receiveBar) {
             const elapsedSeconds = Math.max((Date.now() - startedAt) / 1000, 0.001);
@@ -241,7 +346,8 @@ export async function startReceiver(port: number, targetDir: string, filters: st
               files: writtenCount,
               fileTotal: expectedFileCount,
               speed: speedMbps.toFixed(2),
-              elapsed: formatElapsed(elapsedSeconds)
+              elapsed: formatElapsed(elapsedSeconds),
+              file: needed.size === 0 ? "-" : formatPathForDisplay("waiting...")
             });
             receiveBar.stop();
             receiveBar = undefined;
@@ -301,6 +407,7 @@ export async function pushToReceiver(options: {
 
   await new Promise<void>((resolve, reject) => {
     const socket = net.createConnection({ host: options.host, port: options.port });
+    socket.setNoDelay(true);
     const byPath = new Map(manifest.map((f) => [f.path, f]));
     let uploadFiles = 0;
     let uploadedFiles = 0;
@@ -348,7 +455,8 @@ export async function pushToReceiver(options: {
 
           progressBar = new cliProgress.SingleBar(
             {
-              format: `${chalk.cyan("Upload")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} | {speed} MB/s | {elapsed}`,
+              format:
+                `${chalk.cyan("Upload")} [{bar}] {pct}% | {sent}/{size} | {files}/{fileTotal} | {speed} MB/s | {elapsed} | {file}`,
               barsize: 28,
               hideCursor: true,
               clearOnComplete: false,
@@ -366,24 +474,65 @@ export async function pushToReceiver(options: {
             files: uploadedFiles,
             fileTotal: uploadFiles,
             speed: "0.00",
-            elapsed: "0:00"
+            elapsed: "0:00",
+            file: "-"
           });
 
-          for (const relPath of msg.files) {
+          const preloadFile = async (relPath: string) => {
             const info = byPath.get(relPath);
-            if (!info) continue;
+            if (!info) {
+              return undefined;
+            }
 
             const abs = path.join(options.sourceDir, relPath);
             const data = await fs.readFile(abs);
+            return {
+              relPath,
+              info,
+              dataBase64: data.toString("base64")
+            };
+          };
+
+          const preloadQueue = new Map<number, Promise<Awaited<ReturnType<typeof preloadFile>>>>();
+          const queuePreload = (index: number): void => {
+            if (index >= msg.files.length || preloadQueue.has(index)) {
+              return;
+            }
+            preloadQueue.set(index, preloadFile(msg.files[index]));
+          };
+
+          for (let index = 0; index < Math.min(SEND_PRELOAD_CONCURRENCY, msg.files.length); index += 1) {
+            queuePreload(index);
+          }
+
+          for (let index = 0; index < msg.files.length; index += 1) {
+            queuePreload(index + SEND_PRELOAD_CONCURRENCY);
+            const prepared = await preloadQueue.get(index);
+            preloadQueue.delete(index);
+            if (!prepared) {
+              continue;
+            }
+
+            progressBar.update(Math.min(uploadedBytes, Math.max(uploadBytes, 1)), {
+              pct: uploadBytes === 0 ? "100.00" : ((uploadedBytes / uploadBytes) * 100).toFixed(2),
+              sent: formatBytes(uploadedBytes),
+              size: formatBytes(uploadBytes),
+              files: uploadedFiles,
+              fileTotal: uploadFiles,
+              speed: lastSpeedMbps.toFixed(2),
+              elapsed: formatElapsed(Math.max((Date.now() - uploadStartedAt) / 1000, 0)),
+              file: formatPathForDisplay(prepared.relPath)
+            });
+
             await writeMessageAsync(socket, {
               type: "file",
-              path: relPath,
-              dataBase64: data.toString("base64"),
-              sha1: info.sha1
+              path: prepared.relPath,
+              dataBase64: prepared.dataBase64,
+              sha1: prepared.info.sha1
             });
 
             uploadedFiles += 1;
-            uploadedBytes += info.size;
+            uploadedBytes += prepared.info.size;
             const elapsedSeconds = Math.max((Date.now() - uploadStartedAt) / 1000, 0.001);
             lastSpeedMbps = uploadedBytes / (1024 * 1024) / elapsedSeconds;
             const actualPct = uploadBytes === 0 ? 100 : (uploadedBytes / uploadBytes) * 100;
@@ -395,8 +544,10 @@ export async function pushToReceiver(options: {
               files: uploadedFiles,
               fileTotal: uploadFiles,
               speed: lastSpeedMbps.toFixed(2),
-              elapsed: formatElapsed(elapsedSeconds)
+              elapsed: formatElapsed(elapsedSeconds),
+              file: formatPathForDisplay(prepared.relPath)
             });
+            progressBar.log(chalk.gray(`sent ${prepared.relPath}\n`));
           }
 
           const finalElapsedSeconds = Math.max((Date.now() - uploadStartedAt) / 1000, 0.001);
@@ -409,7 +560,8 @@ export async function pushToReceiver(options: {
             files: uploadedFiles,
             fileTotal: uploadFiles,
             speed: lastSpeedMbps.toFixed(2),
-            elapsed: formatElapsed(finalElapsedSeconds)
+            elapsed: formatElapsed(finalElapsedSeconds),
+            file: "-"
           });
           progressBar.stop();
           progressBar = undefined;

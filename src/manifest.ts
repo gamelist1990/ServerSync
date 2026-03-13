@@ -16,6 +16,33 @@ type HashCacheEntry = {
 
 type HashCache = Record<string, HashCacheEntry>;
 
+const HASH_CONCURRENCY = 4;
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const runWorker = async (): Promise<void> => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  };
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
 function normalizeFilterForRoot(rawFilter: string, rootDir: string): string {
   const cleaned = rawFilter.trim().replace(/^['\"]+|['\"]+$/g, "").replaceAll("\\", "/").replace(/^\.\//, "");
   if (!cleaned) return "";
@@ -95,10 +122,9 @@ export async function buildManifest(rootDir: string, filters: string[]): Promise
   }
 
   const walked = await collectFiles(rootDir, filters);
-  const items: FileManifestItem[] = [];
   let cacheUpdated = false;
 
-  for (const absPath of walked.files) {
+  const items = await mapConcurrent(walked.files, HASH_CONCURRENCY, async (absPath) => {
     const stat = await fs.stat(absPath);
     const rel = path.relative(rootDir, absPath).replaceAll("\\", "/");
 
@@ -113,13 +139,13 @@ export async function buildManifest(rootDir: string, filters: string[]): Promise
       cacheUpdated = true;
     }
 
-    items.push({
+    return {
       path: rel,
       size: stat.size,
       mtimeMs: stat.mtimeMs,
       sha1
-    });
-  }
+    };
+  });
 
   // 変更があった場合のみキャッシュを保存
   if (cacheUpdated) {
