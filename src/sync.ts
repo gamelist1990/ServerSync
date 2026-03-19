@@ -51,6 +51,15 @@ function formatPathForDisplay(relativePath: string, maxLength = 56): string {
   return `${normalized.slice(0, keep)}...${normalized.slice(-(maxLength - keep - 3))}`;
 }
 
+function logBarMessage(bar: { log?: (message: string) => void } | undefined, message: string): void {
+  if (bar && typeof bar.log === "function") {
+    bar.log(message);
+    return;
+  }
+
+  console.log(message);
+}
+
 async function removeEmptyParentDirs(rootDir: string, filePath: string): Promise<void> {
   const resolvedRoot = path.resolve(rootDir);
   let currentDir = path.dirname(path.resolve(filePath));
@@ -305,7 +314,7 @@ export async function startReceiver(port: number, targetDir: string, filters: st
                 elapsed: formatElapsed(elapsedSeconds),
                 file: formatPathForDisplay(msg.path)
               });
-              receiveBar.log(chalk.gray(`received ${msg.path}\n`));
+              logBarMessage(receiveBar, chalk.gray(`received ${msg.path}\n`));
             }
 
             if (writtenCount % 50 === 0 || needed.size === 0) {
@@ -547,7 +556,7 @@ export async function pushToReceiver(options: {
               elapsed: formatElapsed(elapsedSeconds),
               file: formatPathForDisplay(prepared.relPath)
             });
-            progressBar.log(chalk.gray(`sent ${prepared.relPath}\n`));
+            logBarMessage(progressBar, chalk.gray(`sent ${prepared.relPath}\n`));
           }
 
           const finalElapsedSeconds = Math.max((Date.now() - uploadStartedAt) / 1000, 0.001);
@@ -572,9 +581,9 @@ export async function pushToReceiver(options: {
 
         if (msg.type === "status") {
           serverStatus = msg;
-          // バー動作中は bar.log() で安全に出力、停止中なら抑制（サマリーで確認できる）
           if (progressBar) {
-            progressBar.log(
+            logBarMessage(
+              progressBar,
               chalk.gray(`Server: phase=${msg.phase}  recv=${msg.received}/${msg.expected}  pending=${msg.pending}\n`)
             );
           }
