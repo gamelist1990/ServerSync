@@ -60,11 +60,27 @@ function logBarMessage(bar: { log?: (message: string) => void } | undefined, mes
   console.log(message);
 }
 
+function isPathWithinRoot(rootDir: string, candidatePath: string): boolean {
+  const relative = path.relative(path.resolve(rootDir), path.resolve(candidatePath));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function resolvePathWithinRoot(rootDir: string, relativePath: string): string {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedPath = path.resolve(rootDir, relativePath);
+
+  if (!isPathWithinRoot(resolvedRoot, resolvedPath)) {
+    throw new Error(`Refusing path outside root: ${relativePath}`);
+  }
+
+  return resolvedPath;
+}
+
 async function removeEmptyParentDirs(rootDir: string, filePath: string): Promise<void> {
   const resolvedRoot = path.resolve(rootDir);
   let currentDir = path.dirname(path.resolve(filePath));
 
-  while (currentDir.startsWith(resolvedRoot) && currentDir !== resolvedRoot) {
+  while (isPathWithinRoot(resolvedRoot, currentDir) && currentDir !== resolvedRoot) {
     const entries = await fs.readdir(currentDir);
     if (entries.length > 0) {
       return;
@@ -153,14 +169,6 @@ export async function startReceiver(port: number, targetDir: string, filters: st
     let writtenCount = 0;
     let receiveBar: any;
     const pendingReceiveWrites = new Set<Promise<void>>();
-    const logReceiveProgress = (message: string): void => {
-      if (receiveBar && typeof receiveBar.log === "function") {
-        receiveBar.log(`${message}\n`);
-        return;
-      }
-
-      console.log(message);
-    };
 
     console.log(chalk.cyan(`[receiver] connected: ${remote}`));
 
@@ -234,7 +242,7 @@ export async function startReceiver(port: number, targetDir: string, filters: st
           );
 
           await forEachConcurrent(deleteList, DELETE_CONCURRENCY, async (rel) => {
-            const absToDelete = path.join(targetDir, rel);
+            const absToDelete = resolvePathWithinRoot(targetDir, rel);
             await fs.rm(absToDelete, { force: true });
             await removeEmptyParentDirs(targetDir, absToDelete);
             deletedCount += 1;
@@ -292,7 +300,7 @@ export async function startReceiver(port: number, targetDir: string, filters: st
             });
           }
           const receiveTask = (async () => {
-            const absPath = path.join(targetDir, msg.path);
+            const absPath = resolvePathWithinRoot(targetDir, msg.path);
             const data = Buffer.from(msg.dataBase64, "base64");
             const actualHash = sha1Buffer(data);
             if (actualHash !== msg.sha1) {
@@ -322,9 +330,8 @@ export async function startReceiver(port: number, targetDir: string, filters: st
                 elapsed: formatElapsed(elapsedSeconds),
                 file: formatPathForDisplay(msg.path)
               });
-              logBarMessage(receiveBar, chalk.gray(`received ${msg.path}\n`));
             }
-            logReceiveProgress(chalk.gray(`received ${msg.path}`));
+            logBarMessage(receiveBar, chalk.gray(`received ${msg.path}\n`));
 
             if (writtenCount % 50 === 0 || needed.size === 0) {
               sendStatus("receiving");
@@ -502,7 +509,7 @@ export async function pushToReceiver(options: {
               return undefined;
             }
 
-            const abs = path.join(options.sourceDir, relPath);
+            const abs = resolvePathWithinRoot(options.sourceDir, relPath);
             const data = await fs.readFile(abs);
             return {
               relPath,
