@@ -144,6 +144,14 @@ export async function startReceiver(port: number, targetDir: string, filters: st
     let writtenCount = 0;
     let receiveBar: any;
     const pendingReceiveWrites = new Set<Promise<void>>();
+    const logReceiveProgress = (message: string): void => {
+      if (receiveBar && typeof receiveBar.log === "function") {
+        receiveBar.log(`${message}\n`);
+        return;
+      }
+
+      console.log(message);
+    };
 
     console.log(chalk.cyan(`[receiver] connected: ${remote}`));
 
@@ -305,8 +313,8 @@ export async function startReceiver(port: number, targetDir: string, filters: st
                 elapsed: formatElapsed(elapsedSeconds),
                 file: formatPathForDisplay(msg.path)
               });
-              receiveBar.log(chalk.gray(`received ${msg.path}\n`));
             }
+            logReceiveProgress(chalk.gray(`received ${msg.path}`));
 
             if (writtenCount % 50 === 0 || needed.size === 0) {
               sendStatus("receiving");
