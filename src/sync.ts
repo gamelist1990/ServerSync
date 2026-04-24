@@ -76,17 +76,45 @@ function resolvePathWithinRoot(rootDir: string, relativePath: string): string {
   return resolvedPath;
 }
 
+function getErrorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
+
 async function removeEmptyParentDirs(rootDir: string, filePath: string): Promise<void> {
   const resolvedRoot = path.resolve(rootDir);
   let currentDir = path.dirname(path.resolve(filePath));
 
   while (isPathWithinRoot(resolvedRoot, currentDir) && currentDir !== resolvedRoot) {
-    const entries = await fs.readdir(currentDir);
+    let entries: string[];
+    try {
+      entries = await fs.readdir(currentDir);
+    } catch (error) {
+      if (getErrorCode(error) === "ENOENT") {
+        currentDir = path.dirname(currentDir);
+        continue;
+      }
+      throw error;
+    }
+
     if (entries.length > 0) {
       return;
     }
 
-    await fs.rmdir(currentDir);
+    try {
+      await fs.rmdir(currentDir);
+    } catch (error) {
+      const code = getErrorCode(error);
+      if (code === "ENOENT") {
+        currentDir = path.dirname(currentDir);
+        continue;
+      }
+      if (code === "ENOTEMPTY" || code === "EEXIST") {
+        return;
+      }
+      throw error;
+    }
     currentDir = path.dirname(currentDir);
   }
 }
