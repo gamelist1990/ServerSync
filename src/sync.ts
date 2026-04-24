@@ -110,7 +110,7 @@ async function removeEmptyParentDirs(rootDir: string, filePath: string): Promise
         currentDir = path.dirname(currentDir);
         continue;
       }
-      if (code === "ENOTEMPTY" || code === "EEXIST") {
+      if (code === "ENOTEMPTY" || code === "EEXIST" || code === "EPERM") {
         return;
       }
       throw error;
